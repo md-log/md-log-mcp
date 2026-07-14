@@ -1,0 +1,28 @@
+# Smithery listing config for md-log-mcp (stdio path).
+# Used by Smithery's GitHub-connect import (repo must be PUBLIC) or as a reference for the MCPB bundle manifest.
+# Field shape verified 2026-07 against a live smithery.yaml (hustcc/mcp-mermaid). Re-check `smithery mcp publish --help`.
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required: ["mdlogPat"]
+    properties:
+      mdlogApiBaseUrl:
+        type: string
+        default: "https://app.md-log.com/api/v1"
+        description: "Base URL of the hosted md-log API (must include /api/v1)"
+      mdlogPat:
+        type: string
+        description: "md-log Personal Access Token (mdlog_pat_...) — minted in the web app under Settings → Tokens"
+  commandFunction: |-
+    (config) => ({
+      command: 'npx',
+      args: ['-y', 'md-log-mcp'],
+      env: {
+        MDLOG_API_BASE_URL: config.mdlogApiBaseUrl,
+        MDLOG_PAT: config.mdlogPat
+      }
+    })
+  exampleConfig:
+    mdlogApiBaseUrl: "https://app.md-log.com/api/v1"
+    mdlogPat: "mdlog_pat_example000000000000000000000000"
