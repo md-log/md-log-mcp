@@ -7,9 +7,11 @@
 
 > **Review the report, not the diff.** An MCP server that lets your AI coding agent — **Claude Code, Claude Desktop, Codex, Cursor** — save its work and analysis as immutable, versioned **Markdown reports** into [**md-log**](https://md-log.com), a human-in-the-loop review & archive layer for **"vibe coding."** You then read and **stylus-annotate** (S-Pen / Apple Pencil) those reports on web, phone, and tablet — every save a new immutable version.
 
-A stdio [Model Context Protocol](https://modelcontextprotocol.io) server that lets **Claude Code**
-(and other agents) save `.md` files — text **and** embedded screenshots together — straight into
-**md-log**, a human-in-the-loop review & archive layer for vibe coding. The agent writes a report
+A [Model Context Protocol](https://modelcontextprotocol.io) server — **two transports, one tool set** —
+that lets **Claude Code** (and other agents) save `.md` files — text **and** embedded screenshots
+together — straight into **md-log**, a human-in-the-loop review & archive layer for vibe coding. The
+**recommended** way to connect is the **hosted remote endpoint** (`https://mcp.md-log.com/mcp`, a URL +
+your key — no install); a local **stdio** (`npx -y md-log-mcp`) transport is the alternative. The agent writes a report
 **by path** (`my-project/2026-07-07-error-report.md`); missing folders are auto-created, images are
 uploaded and their references rewritten to `asset://` links, and every save becomes an immutable new
 version. The same report is then readable, editable, and stylus-annotatable (S-Pen / Apple Pencil
@@ -115,13 +117,45 @@ MDLOG_PAT="mdlog_pat_xxxx" \
 node scripts/smoke.mjs        # or: npm run smoke
 ```
 
-## MCP client config
+## Connect a client
 
-> 📄 **연결 가이드 (HTML)** — [md-log.com/guides/customer-guide.html](https://www.md-log.com/guides/customer-guide.html): md-log 웹 앱에서 발급받은 **MCP 키(PAT)** 와 고정 서비스 주소(`https://app.md-log.com/api/v1`)만으로 `npx` 연결 (Claude Code · Desktop · Codex · Cursor). 빌드·레포 불필요.
+Mint the PAT in the web app's **Settings → Tokens**, store it securely, then add md-log to your MCP
+client. **Never commit a PAT.**
 
-Mint the PAT in the web app's **Settings → Tokens**, store it securely, then add the server to your
-`~/.claude.json` (user-scoped) **or** a project-local `.mcp.json`. No install or build step — `npx`
-fetches the published package. **Never commit a PAT.**
+> 📄 **연결 가이드 (HTML)** — [md-log.com/guides/customer-guide.html](https://www.md-log.com/guides/customer-guide.html): 웹 앱에서 발급받은 **MCP 키(PAT)** 로 URL 연결(권장) 또는 `npx` 로컬 연결 (Claude Code · Desktop · Codex · Cursor).
+
+### Recommended — remote (URL), no install
+
+Point your client at the **hosted endpoint** and pass the PAT as a Bearer header. **Nothing to
+install — no Node.js, no `npx`.** (You don't even need this package for the hosted connection.)
+
+```bash
+# Claude Code
+claude mcp add --transport http md-log https://mcp.md-log.com/mcp \
+  --header "Authorization: Bearer mdlog_pat_xxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+```jsonc
+// Cursor / Claude Desktop / any client that takes JSON — the `type` field MUST be "http"
+{
+  "mcpServers": {
+    "md-log": {
+      "type": "http",
+      "url": "https://mcp.md-log.com/mcp",
+      "headers": { "Authorization": "Bearer mdlog_pat_xxxxxxxxxxxxxxxxxxxxxxxx" }
+    }
+  }
+}
+```
+
+Over the remote endpoint, embed images inline (base64); uploading a local image **by path**
+(`file_path`) works only with the local method below.
+
+### Alternative — local (stdio via `npx`)
+
+Runs this connector as a local subprocess (needs Node 22+; `npx` fetches the published package, nothing
+to build). Use it if you prefer a local process, need local-file (`file_path`) image uploads, or
+self-host md-log without a hosted MCP endpoint.
 
 ```jsonc
 {
