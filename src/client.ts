@@ -73,6 +73,11 @@ export function mapError(
   if (serverCode === "MDLOG_DOC_0007") {
     return new MdlogError("QUOTA_EXCEEDED", message, opts);
   }
+  // Cross-scope move rejection (400) — a distinct code from quota so the agent doesn't misread it as
+  // "storage full" and retry destructively. It's a plain validation failure, not something to reconcile.
+  if (serverCode === "MDLOG_DOC_0008" || serverCode === "MDLOG_FLD_0008") {
+    return new MdlogError("VALIDATION", message, opts);
+  }
   // Optimistic concurrency conflict — carries the server head in `detail`.
   if (serverCode === "MDLOG_SYNC_0409" || status === 409) {
     return new MdlogError("CONFLICT", message, opts);

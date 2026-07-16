@@ -1,8 +1,8 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.md-log/md-log-mcp",
-  "description": "md-log MCP server: save, update & fetch markdown reports by path (stdio, PAT auth).",
-  "version": "1.0.8",
+  "description": "md-log MCP server: save, update & fetch markdown reports by path (stdio + remote Streamable HTTP, PAT auth).",
+  "version": "1.1.0",
   "repository": {
     "url": "https://github.com/md-log/md-log-mcp",
     "source": "github"
@@ -12,7 +12,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "md-log-mcp",
-      "version": "1.0.8",
+      "version": "1.1.0",
       "transport": {
         "type": "stdio"
       },

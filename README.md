@@ -23,12 +23,16 @@ Personal Access Token from the web app.
 
 ## Stack
 
-- **@modelcontextprotocol/sdk** (TypeScript) — `McpServer` + `StdioServerTransport`.
-- **stdio transport** — JSON-RPC over stdin/stdout (so stdout is reserved for the protocol; logs go
-  to stderr).
-- **TypeScript**, bundled with **tsup** to ESM `dist/server.js`. Runtime deps: the MCP SDK and
-  **zod** (input schemas). Node's built-in `fetch` is the only HTTP layer.
-- **PAT auth** — a long-lived md-log Personal Access Token sent as `Authorization: Bearer`.
+- **@modelcontextprotocol/sdk** (TypeScript) — one `McpServer` (15 tools), two transports.
+- **stdio transport** (`md-log-mcp`) — JSON-RPC over stdin/stdout; the default local mode (so stdout
+  is reserved for the protocol; logs go to stderr). PAT from env.
+- **Streamable HTTP transport** (`md-log-mcp-http`) — the remote mode: agents connect by URL with no
+  local install; the PAT is taken **per request** from the `Authorization` header. See
+  [Remote (Streamable HTTP) mode](#remote-streamable-http-mode).
+- **TypeScript**, bundled with **tsup** to ESM `dist/server.js` (stdio) + `dist/http.js` (HTTP).
+  Runtime deps: the MCP SDK and **zod** (input schemas). Node's built-in `fetch`/`http` are the only
+  network layers — no web framework.
+- **PAT auth** — a md-log Personal Access Token sent to the backend as `Authorization: Bearer`.
 
 ## Requirements
 
@@ -144,10 +148,73 @@ fetches the published package. **Never commit a PAT.**
 >
 > If a PAT leaks, revoke it in the web app and mint a new one.
 
+## Remote (Streamable HTTP) mode
+
+The second bin, **`md-log-mcp-http`**, serves the **same 15 tools** over MCP's
+[Streamable HTTP transport](https://modelcontextprotocol.io/docs/concepts/transports) — a single
+`POST /mcp` endpoint — so agents connect by **URL with no local install**. Use it when you want to
+host the connector centrally (a container / small VM behind a TLS reverse proxy) instead of every
+user running `npx`.
+
+How it differs from stdio:
+
+- **PAT per request.** The token is **not** read from env; each request carries its own
+  `Authorization: Bearer <mdlog_pat_…>` header, so **one endpoint serves many users** — each with
+  their own md-log token. (`MDLOG_PAT` is ignored in this mode.)
+- **Stateless.** A fresh client + server per request; no session store (replica / autoscale friendly).
+- **No local files.** The `file_path` image source is **refused** (it would read the *server's* disk);
+  send images inline as `data_base64`. Everything else is identical.
+
+### Run it
+
+```bash
+npm run build
+MDLOG_API_BASE_URL="https://app.md-log.com/api/v1" \
+node dist/http.js            # or: npm run start:http
+# → md-log-mcp-http ready — POST http://127.0.0.1:8787/mcp
+```
+
+### Configuration (env)
+
+| Variable | Required | Default | Notes |
+| -------- | -------- | ------- | ----- |
+| `MDLOG_API_BASE_URL` | yes | — | Hosted md-log base, **including** `/api/v1`. |
+| `MDLOG_HTTP_HOST` | no | `127.0.0.1` | Bind interface. Localhost-only by default; set `0.0.0.0` **only** behind a TLS reverse proxy. |
+| `MDLOG_HTTP_PORT` | no | `8787` | TCP port. |
+| `MDLOG_HTTP_PATH` | no | `/mcp` | The MCP endpoint path. |
+| `MDLOG_HTTP_ALLOWED_ORIGINS` | no | *(none)* | Comma-separated browser `Origin` allowlist (DNS-rebinding defense). A request that **carries** an `Origin` not on the list is `403`d; non-browser clients (no `Origin`) are always allowed. |
+| `MDLOG_HTTP_ALLOWED_HOSTS` | no | *(none)* | Optional comma-separated `Host` allowlist (extra DNS-rebinding defense). |
+| `MDLOG_HTTP_MAX_BODY_BYTES` | no | `33554432` (32 MiB) | Max request body (base64 images inflate ~33%). |
+
+**Security posture** (per the MCP spec): binds to `127.0.0.1` by default, requires a Bearer token on
+every MCP request, validates `Origin` against the allowlist to defeat DNS-rebinding, and caps the body
+size. A `GET /health` liveness probe (no auth) returns `{"status":"ok"}`. `GET`/`DELETE` on the MCP
+endpoint return `405` (stateless: no standalone SSE stream, no session to terminate).
+
+### Connect an agent by URL
+
+```jsonc
+{
+  "mcpServers": {
+    "md-log": {
+      "type": "http",
+      "url": "https://your-host.example/mcp",
+      "headers": { "Authorization": "Bearer mdlog_pat_xxxxxxxxxxxxxxxxxxxxxxxx" }
+    }
+  }
+}
+```
+
+> Client config shape varies (Claude Code / Cursor / etc.) — the essentials are the endpoint **URL**
+> and an `Authorization: Bearer <PAT>` header. Always terminate TLS in front of a public deployment;
+> the PAT rides on every request.
+
 ## Scripts
 
-- `npm run build` — bundle to `dist/server.js` (tsup, ESM, Node 22).
+- `npm run build` — bundle to `dist/server.js` (stdio) + `dist/http.js` (Streamable HTTP) (tsup, ESM, Node 22).
 - `npm run dev` — rebuild on change (`tsup --watch`).
 - `npm run typecheck` — `tsc --noEmit`.
-- `npm run smoke` — run the smoke test (needs env + a build).
-- `npm start` — run the built server directly (`node dist/server.js`).
+- `npm run smoke` — stdio smoke test against a live backend (needs env + a build).
+- `npm run smoke:http` — **backend-free** HTTP-transport smoke test (handshake + auth/origin/file_path guards).
+- `npm start` — run the built stdio server (`node dist/server.js`).
+- `npm run start:http` — run the built HTTP server (`node dist/http.js`).
