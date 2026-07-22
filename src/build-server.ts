@@ -463,7 +463,11 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
       description:
         "Save (create or overwrite) a .md file in md-log by path; missing folders are " +
         "auto-created. Optionally upload embedded images as assets first and rewrite their refs " +
-        "to asset:// links. This is a force-write (last-writer-wins) — the headline agent tool.",
+        "to asset:// links. This is a force-write (last-writer-wins) — the headline agent tool. " +
+        "Before choosing a path, PREFER an existing folder that already holds related documents and " +
+        "reuse its exact spelling — do not invent a new casing or separator (e.g. don't save to " +
+        "'MdLog/…' when 'md-log/…' already exists). Call list_folders / list_files first if unsure. " +
+        "(The server also auto-reuses a unique near-duplicate folder, but consistent spelling keeps paths clean.)",
       inputSchema: {
         path: filePathField,
         content: z.string().describe("Full markdown content of the file."),
