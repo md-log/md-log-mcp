@@ -379,6 +379,31 @@ async function ensureFolderPath(
   return { folderKey: parentKey, createdSegments };
 }
 
+/**
+ * Turn the backend's terse cross-scope rejection into actionable guidance. A shared subtree is
+ * single-owner/single-org, so the server refuses to reparent a document/folder across share scopes
+ * (out of a shared folder/team into private space, or vice-versa) with MDLOG_DOC_0008 / MDLOG_FLD_0008.
+ * The raw message ("Cannot move a shared document out of its shared folder/team") is correct but doesn't
+ * say WHY or WHAT to do, so we rewrite it; every other error passes through untouched.
+ */
+function explainCrossScopeMove(err: unknown, fromPath: string, toPath: string): unknown {
+  if (
+    err instanceof MdlogError &&
+    (err.serverCode === "MDLOG_DOC_0008" || err.serverCode === "MDLOG_FLD_0008")
+  ) {
+    return new MdlogError(
+      "VALIDATION",
+      `Cannot move "${fromPath}" to "${toPath}": the source and destination are in different share ` +
+        `scopes — one lives inside a shared folder/team and the other in your private space. A shared ` +
+        `subtree is single-owner, so an item can only be moved WITHIN the same shared folder or entirely ` +
+        `within your private space. To relocate across scopes, first unshare the source folder (or share ` +
+        `the destination into the same team), then move; otherwise re-create the file at the destination.`,
+      { serverCode: err.serverCode, status: err.status, detail: err.detail },
+    );
+  }
+  return err;
+}
+
 // ---------------------------------------------------------------------------
 // Zod schemas
 // ---------------------------------------------------------------------------
@@ -927,7 +952,13 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
         // M-12: pre-check the destination so a name collision fails EARLY with no partial mutation. Without
         // it, a committed move followed by a rename that 409s on a name clash would strand the doc at
         // toFolder/fromName — and a retry with from_path would 404 and read as data loss.
-        const existingAtDest = await client.getByPath(to.path);
+        // getByPath THROWS NOT_FOUND when nothing occupies the destination — the NORMAL case for a move or
+        // rename — so swallow that (null = "vacant, proceed") and only propagate real errors. Leaving this
+        // unguarded made EVERY move to an empty path fail with "[NOT_FOUND] No resource exists at this path".
+        const existingAtDest = await client.getByPath(to.path).catch((e: unknown) => {
+          if (e instanceof MdlogError && e.code === "NOT_FOUND") return null;
+          throw e;
+        });
         const existingKey: string | undefined = existingAtDest?.document_key ?? existingAtDest?.key;
         if (existingKey && existingKey !== documentKey) {
           throw new MdlogError("CONFLICT", `a different document already occupies "${to.path}".`);
@@ -947,7 +978,12 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
         if (fromFolder !== toFolder) {
           const ensured = await ensureFolderPath(client, toFolderSegments);
           newFolderKey = ensured.folderKey ?? null; // null = root
-          await client.moveDocument(documentKey, newFolderKey);
+          try {
+            await client.moveDocument(documentKey, newFolderKey);
+          } catch (moveErr) {
+            // A cross-scope move (shared <-> private) is rejected server-side; give actionable guidance.
+            throw explainCrossScopeMove(moveErr, from.path, to.path);
+          }
           moved = true;
         }
         if (fromName !== toName) {
@@ -1028,9 +1064,15 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
           newParentKey = ensured.folderKey ?? null;
         }
 
-        const res = await client.moveFolder(sourceKey, newParentKey);
         const name = norm.segments[norm.segments.length - 1]!;
         const newPath = parentPath ? `${parentPath}/${name}` : name;
+        let res: any;
+        try {
+          res = await client.moveFolder(sourceKey, newParentKey);
+        } catch (moveErr) {
+          // A cross-scope folder move (shared subtree <-> private) is rejected server-side; guide the caller.
+          throw explainCrossScopeMove(moveErr, norm.path, newPath);
+        }
         return ok(`Moved folder "${norm.path}" -> "${newPath}" (subtree intact).`, {
           from_path: norm.path,
           to_path: newPath,
