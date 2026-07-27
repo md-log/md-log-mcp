@@ -98,7 +98,14 @@ export function validatePath(
     if (seg === "." || seg === "..") {
       throw new MdlogError("VALIDATION", `path may not contain '.' or '..' segments: "${input}"`);
     }
-    if (RESERVED_NAMES.has(seg.toUpperCase())) {
+    // Windows treats a reserved device name as reserved REGARDLESS of extension ("CON.md" IS CON),
+    // so check the stem before the first '.' as well as the whole segment. ('..' is already rejected
+    // above; a segment like ".md" has an empty stem, hence the length guard.)
+    const stem = seg.includes(".") ? seg.slice(0, seg.indexOf(".")) : seg;
+    if (
+      RESERVED_NAMES.has(seg.toUpperCase()) ||
+      (stem.length > 0 && RESERVED_NAMES.has(stem.toUpperCase()))
+    ) {
       throw new MdlogError("VALIDATION", `path segment is a reserved name: "${seg}"`);
     }
     if (Buffer.byteLength(seg, "utf8") > 255) {

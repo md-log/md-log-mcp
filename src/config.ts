@@ -120,6 +120,14 @@ export interface HttpConfig {
   allowedHosts: string[];
   /** Max request body size in bytes (base64 images inflate ~33%). Default 32 MiB. */
   maxBodyBytes: number;
+  /**
+   * Max concurrently-processing MCP POSTs. Default 8.
+   *
+   * Auth is only checked to the extent of "a Bearer header is present" before the body is read, and
+   * each in-flight request may buffer up to {@link maxBodyBytes}. Without a ceiling, a handful of
+   * concurrent 32 MiB POSTs carrying any junk token could exhaust a small container's memory.
+   */
+  maxConcurrent: number;
 }
 
 function parseList(raw: string | undefined): string[] {
@@ -159,5 +167,6 @@ export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig
     allowedOrigins: parseList(env.MDLOG_HTTP_ALLOWED_ORIGINS),
     allowedHosts: parseList(env.MDLOG_HTTP_ALLOWED_HOSTS),
     maxBodyBytes: parsePositiveInt(env.MDLOG_HTTP_MAX_BODY_BYTES, 32 * 1024 * 1024),
+    maxConcurrent: parsePositiveInt(env.MDLOG_HTTP_MAX_CONCURRENT, 8),
   };
 }

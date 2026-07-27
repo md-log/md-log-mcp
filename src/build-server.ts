@@ -521,12 +521,21 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
         const norm = validatePath(path, { requireMd: true });
         let finalContent = content;
         const uploaded: { placeholder: string; asset_key: string; ref: string }[] = [];
+        /** Placeholders that never appeared in the content — uploaded but unreferenced. */
+        const unmatched: string[] = [];
 
         if (assets && assets.length > 0) {
           // H15: assets are reserved against an EXISTING document (the backend resolves the doc by path
           // at reserve time). For a brand-new file the reserve 404s, so create the doc first with the raw
           // content (placeholders intact); then upload the assets and re-save the rewritten content below.
-          const existing = await client.getByPath(norm.path).catch(() => null);
+          // Only a genuine NOT_FOUND means "brand-new file". Swallowing everything (401/429/5xx/timeout)
+          // made a transient backend hiccup read as "does not exist", so the pre-create below force-wrote
+          // the raw placeholder content over an EXISTING document — adding a junk intermediate version to
+          // its history. Mirrors the NOT_FOUND-only handling move_markdown already uses.
+          const existing = await client.getByPath(norm.path).catch((e: unknown) => {
+            if (e instanceof MdlogError && e.code === "NOT_FOUND") return null;
+            throw e;
+          });
           if (!existing) {
             await client.putByPath({
               path: norm.path,
@@ -537,7 +546,12 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
           for (const asset of assets) {
             const assetKey = await uploadOneAsset(client, norm.path, asset, allowLocalFiles);
             const ref = `asset://${assetKey}`;
+            // replaceAllLiteral is a silent no-op when the placeholder isn't in `content`: the asset
+            // still uploads and still counts against the owner's quota, but nothing in the document
+            // ever references it. Detect that and report it rather than leaving a silent orphan.
+            const beforeReplace = finalContent;
             finalContent = replaceAllLiteral(finalContent, asset.placeholder, ref);
+            if (finalContent === beforeReplace) unmatched.push(asset.placeholder);
             uploaded.push({ placeholder: asset.placeholder, asset_key: assetKey, ref });
           }
         }
@@ -558,6 +572,12 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
         if (uploaded.length > 0) {
           lines.push(`Uploaded ${uploaded.length} asset(s): ${uploaded.map((u) => u.ref).join(", ")}.`);
         }
+        if (unmatched.length > 0) {
+          lines.push(
+            `WARNING: ${unmatched.length} placeholder(s) were not found in the content, so those ` +
+              `assets are uploaded but UNREFERENCED: ${unmatched.join(", ")}.`,
+          );
+        }
 
         return ok(lines.join(" "), {
           path: norm.path,
@@ -566,6 +586,7 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
           created: created ?? null,
           checksum_sha256: data?.checksum_sha256 ?? null,
           assets: uploaded,
+          unmatched_placeholders: unmatched,
         });
       } catch (err) {
         return fail(err);
@@ -719,6 +740,9 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
         expected_version: z
           .number()
           .int()
+          // Match get_markdown's `version`: version numbers start at 1, so 0/-1 is a client bug that
+          // should be rejected here rather than sent to the backend as a base_version_no.
+          .min(1)
           .optional()
           .describe("Version you based your edit on. Omit to force-overwrite (LWW)."),
         commit_message: z

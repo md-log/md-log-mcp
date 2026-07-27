@@ -39,6 +39,16 @@ import type { HttpConfig } from "./config.js";
 const JSONRPC_PARSE_ERROR = -32700;
 const JSONRPC_INVALID_REQUEST = -32600;
 const JSONRPC_UNAUTHORIZED = -32001; // implementation-defined server error
+const JSONRPC_OVERLOADED = -32002; // implementation-defined: too many concurrent requests
+
+/**
+ * Requests currently between "started reading the body" and "finished responding".
+ *
+ * Each one can hold up to `maxBodyBytes` in memory, and the PAT is not actually validated against the
+ * backend before that buffering happens — only its presence is checked — so this counter is what keeps
+ * a burst of large unauthenticated-in-practice POSTs from exhausting the container's memory.
+ */
+let inFlight = 0;
 
 class BodyTooLargeError extends Error {
   constructor(readonly limit: number) {
@@ -140,7 +150,26 @@ async function handleMcpPost(req: IncomingMessage, res: ServerResponse, cfg: Htt
     return;
   }
 
-  // 2) Body — read with a size cap, then parse.
+  // 2) Concurrency gate — BEFORE buffering anything (see `inFlight`).
+  if (inFlight >= cfg.maxConcurrent) {
+    sendRpcError(res, 503, JSONRPC_OVERLOADED, "Server busy; retry shortly.", { "Retry-After": "1" });
+    return;
+  }
+  inFlight += 1;
+  try {
+    await handleAuthorizedPost(req, res, cfg);
+  } finally {
+    inFlight -= 1;
+  }
+}
+
+async function handleAuthorizedPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cfg: HttpConfig,
+): Promise<void> {
+  const pat = bearerToken(req) as string;
+  // 3) Body — read with a size cap, then parse.
   let parsedBody: unknown;
   try {
     const raw = await readBody(req, cfg.maxBodyBytes);
@@ -171,7 +200,7 @@ async function handleMcpPost(req: IncomingMessage, res: ServerResponse, cfg: Htt
     return;
   }
 
-  // 3) Per-request, stateless server bound to THIS caller's token.
+  // 4) Per-request, stateless server bound to THIS caller's token.
   const client = new MdlogClient({ apiBaseUrl: cfg.apiBaseUrl, pat });
   const server = buildServer(client, { allowLocalFiles: false });
   const transport = new StreamableHTTPServerTransport({
@@ -192,8 +221,17 @@ async function handleMcpPost(req: IncomingMessage, res: ServerResponse, cfg: Htt
     process.stderr.write(
       `md-log-mcp-http: request handling failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`,
     );
-    // If the transport already started writing, we can't change the status.
-    sendRpcError(res, 500, JSONRPC_INVALID_REQUEST, "Internal server error handling the MCP request.");
+    if (!res.headersSent) {
+      sendRpcError(res, 500, JSONRPC_INVALID_REQUEST, "Internal server error handling the MCP request.");
+      return;
+    }
+    // The transport already began writing, so the status can no longer be changed — but sendRpcError
+    // is a no-op once headers are sent, which previously left the client holding a silently truncated
+    // body until its own timeout. Destroy the socket so the peer sees a broken stream immediately.
+    process.stderr.write(
+      "md-log-mcp-http: response already started; destroying the socket (client sees a truncated stream).\n",
+    );
+    res.destroy(err instanceof Error ? err : new Error(String(err)));
   }
 }
 
@@ -249,6 +287,11 @@ function main(): void {
   const cfg = loadHttpConfig(); // throws a clear error if MDLOG_API_BASE_URL is unset/malformed
 
   const httpServer = createServer(makeRequestHandler(cfg));
+
+  // Slowloris bound: without these a client can hold a connection open indefinitely by dribbling
+  // headers or a body, occupying a concurrency slot the whole time.
+  httpServer.headersTimeout = 15_000;
+  httpServer.requestTimeout = 60_000;
 
   httpServer.on("clientError", (_err, socket) => {
     if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
