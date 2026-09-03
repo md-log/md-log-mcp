@@ -5,3 +5,6 @@ dist/
 .env.*
 !.env.example
 .DS_Store
+
+# OMC 운영 산출물 (커밋 대상 아님)
+.omc/

@@ -118,7 +118,16 @@ export interface HttpConfig {
    * Optional `Host` header allowlist (extra DNS-rebinding defense). Empty = Host not checked.
    */
   allowedHosts: string[];
-  /** Max request body size in bytes (base64 images inflate ~33%). Default 32 MiB. */
+  /**
+   * Max request body size in bytes. Default 32 MiB.
+   *
+   * MUST stay ABOVE the document cap ({@link resolveMaxDocumentBytes}, 25 MiB): one save_markdown POST
+   * carries the markdown body AND any inline `data_base64` assets, and base64 inflates ~33% — so a
+   * legal, at-the-cap document plus assets legitimately exceeds 25 MiB on the wire. 32 MiB leaves ~28%
+   * headroom. Lowering this to or below the document cap makes valid saves fail at the transport with a
+   * body-size error the tool layer never sees: readBody (http.ts) rejects before any handler runs, so
+   * the agent gets no structured MdlogError and no pre-flight message.
+   */
   maxBodyBytes: number;
   /**
    * Max concurrently-processing MCP POSTs. Default 8.
@@ -140,6 +149,20 @@ function parseList(raw: string | undefined): string[] {
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   const n = Number.parseInt((raw ?? "").trim(), 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * The backend's per-document body cap, in UTF-8 BYTES — mirrors `Constant.MAX_DOCUMENT_BYTES` (25 MiB).
+ * Used by the client to pre-flight a save so an oversize body fails fast with a clear, structured error
+ * instead of an opaque backend 400 or a 60s REQUEST_TIMEOUT_MS abort on a stalled upload.
+ *
+ * Applies to BOTH transports (it lives in the client, not in Config/HttpConfig). Keep the default EQUAL
+ * to the backend's constant: a higher value merely defers to the server's own 400 (harmless), a lower
+ * one rejects documents the server would happily accept. Override only against a self-hosted backend
+ * whose Constant.MAX_DOCUMENT_BYTES differs.
+ */
+export function resolveMaxDocumentBytes(env: NodeJS.ProcessEnv = process.env): number {
+  return parsePositiveInt(env.MDLOG_MAX_DOCUMENT_BYTES, 25 * 1024 * 1024);
 }
 
 export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig {

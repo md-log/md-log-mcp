@@ -12,6 +12,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { resolveMaxDocumentBytes } from "./config.js";
 import type { Config } from "./config.js";
 
 /** Stable, agent-facing error codes (see plan §7.4 "Errors -> agent codes"). */
@@ -132,6 +133,13 @@ const REQUEST_TIMEOUT_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
 })();
 
+/**
+ * Client-side mirror of the backend's 25 MiB per-document cap (Constant.MAX_DOCUMENT_BYTES), resolved
+ * once at module load exactly like REQUEST_TIMEOUT_MS above. Read via config so the env-var contract
+ * lives in one place; override with MDLOG_MAX_DOCUMENT_BYTES.
+ */
+const MAX_DOCUMENT_BYTES = resolveMaxDocumentBytes();
+
 export class MdlogClient {
   private readonly base: string;
   private readonly pat: string;
@@ -235,6 +243,34 @@ export class MdlogClient {
     commitMessage?: string;
     createFolders?: boolean;
   }): Promise<any> {
+    // Pre-flight the backend's 25 MiB document cap HERE rather than per tool: every write lane funnels
+    // through putByPath — save_markdown, update_markdown, edit_markdown and append_to_markdown, which
+    // pushes the MERGED existing+new body and is the one lane that can silently grow past the cap while
+    // each individual append stays tiny. Byte length, not .length: the cap is UTF-8 BYTES and Korean is
+    // 3 bytes/char, so a char count under-reports by ~3x. Without this, oversize surfaces as an opaque
+    // backend 400 or, if the upload stalls, a 60s REQUEST_TIMEOUT_MS abort.
+    // VALIDATION is deliberate: mapError() already routes the server's own 400 (MDLOG_DOC_0006) to
+    // VALIDATION, so the agent sees an identical code whether the cap trips locally or remotely. NOT
+    // QUOTA_EXCEEDED — that means "storage full" (MDLOG_DOC_0007) and an agent may react by deleting
+    // other documents.
+    const contentBytes = Buffer.byteLength(args.content, "utf8");
+    if (contentBytes > MAX_DOCUMENT_BYTES) {
+      throw new MdlogError(
+        "VALIDATION",
+        `document body is ${contentBytes} bytes when UTF-8 encoded, over the ${MAX_DOCUMENT_BYTES}-byte ` +
+          `server cap for "${args.path}". Split it into smaller documents, or move large embedded images ` +
+          "to upload_asset (asset:// references) instead of inline data: URIs.",
+        {
+          detail: {
+            path: args.path,
+            content_bytes: contentBytes,
+            max_bytes: MAX_DOCUMENT_BYTES,
+            over_by_bytes: contentBytes - MAX_DOCUMENT_BYTES,
+          },
+        },
+      );
+    }
+
     const body: Record<string, unknown> = {
       path: args.path,
       content: args.content,
@@ -301,6 +337,26 @@ export class MdlogClient {
     return this.request("GET", `/documents/${encodeURIComponent(documentKey)}/content`, {
       query: { as: "inline", version_no: versionNo },
     });
+  }
+
+  /**
+   * POST /documents/{key}/versions/{versionNo}/restore — re-apply an OLD version's body as a NEW head
+   * version. The history is immutable: nothing is rewound or dropped, the restore is simply another
+   * version on top, so it is itself undoable. Distinct from POST /documents/{key}/restore, which
+   * UN-DELETES a soft-deleted document. Returns the same document shape as the by-path PUT
+   * (document_key, current_version_no, checksum_sha256).
+   *
+   * Restoring the version the document is already on is an idempotent NO-OP server-side: it returns the
+   * UNCHANGED head, so an unmoved current_version_no is success, not failure.
+   */
+  async restoreVersion(documentKey: string, versionNo: number, commitMessage?: string): Promise<any> {
+    const body: Record<string, unknown> = { source: "MCP" };
+    if (commitMessage) body.commit_message = commitMessage;
+    return this.request(
+      "POST",
+      `/documents/${encodeURIComponent(documentKey)}/versions/${encodeURIComponent(String(versionNo))}/restore`,
+      { body },
+    );
   }
 
   /** POST /documents/{key}/move — new_folder_key null/omitted = move to root. */

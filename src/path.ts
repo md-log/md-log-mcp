@@ -135,3 +135,37 @@ export function replaceAllLiteral(haystack: string, needle: string, replacement:
   if (needle.length === 0) return haystack;
   return haystack.split(needle).join(replacement);
 }
+
+/**
+ * Count NON-OVERLAPPING literal occurrences of `needle` in `haystack` (no regex semantics).
+ * Deliberately consistent with replaceAllLiteral's split()/join() semantics, so a count of N means
+ * replaceAllLiteral would perform exactly N replacements. An empty needle counts 0 (never a match),
+ * mirroring replaceAllLiteral's empty-needle no-op, so a caller can never read "" as "matched".
+ *
+ * edit_markdown counts BEFORE writing: 0 matches or an ambiguous >1 must abort with no mutation.
+ */
+export function countLiteral(haystack: string, needle: string): number {
+  if (needle.length === 0) return 0;
+  let count = 0;
+  let from = 0;
+  for (;;) {
+    const at = haystack.indexOf(needle, from);
+    if (at === -1) return count;
+    count++;
+    from = at + needle.length;
+  }
+}
+
+/**
+ * Replace the FIRST literal occurrence of `needle`; returns `haystack` unchanged when absent.
+ *
+ * Uses slice(), NOT String.prototype.replace(): replace() treats '$&', '$1', "$'" and '$`' inside the
+ * REPLACEMENT string as substitution patterns, which would silently corrupt a document whose new text
+ * contains a '$'. Both replacement helpers here are literal in both directions.
+ */
+export function replaceFirstLiteral(haystack: string, needle: string, replacement: string): string {
+  if (needle.length === 0) return haystack;
+  const at = haystack.indexOf(needle);
+  if (at === -1) return haystack;
+  return haystack.slice(0, at) + replacement + haystack.slice(at + needle.length);
+}
