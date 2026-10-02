@@ -1,7 +1,7 @@
 /**
  * md-log-mcp — remote Streamable HTTP entrypoint (the `md-log-mcp-http` bin).
  *
- * Serves the SAME 15 tools as the stdio server over MCP's Streamable HTTP
+ * Serves the SAME 17 tools as the stdio server over MCP's Streamable HTTP
  * transport, so agents connect by URL with no local install. It stays true to
  * the project's "thin, backend-is-the-authority" ethos:
  *

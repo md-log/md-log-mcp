@@ -1,7 +1,7 @@
 /**
  * md-log-mcp — shared tool/server builder (transport-agnostic).
  *
- * `buildServer(client, opts)` registers all 15 tools on a fresh `McpServer` and
+ * `buildServer(client, opts)` registers all 17 tools on a fresh `McpServer` and
  * is reused by BOTH entrypoints: the stdio bootstrap (`server.ts`) and the
  * remote Streamable HTTP bootstrap (`http.ts`). This module has NO top-level
  * side effects (no transport, no process bootstrap) so either entry can import
@@ -27,7 +27,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { MdlogClient, MdlogError, sha256Hex } from "./client.js";
-import { replaceAllLiteral, validatePath } from "./path.js";
+import { countLiteral, replaceAllLiteral, replaceFirstLiteral, validatePath } from "./path.js";
 
 /** Options that vary the tool surface per transport. */
 export interface BuildServerOptions {
@@ -726,14 +726,187 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
     },
   );
 
+  // --- edit_markdown (targeted literal replace) -------------------------
+  server.registerTool(
+    "edit_markdown",
+    {
+      title: "Edit Markdown",
+      description:
+        "Change PART of an existing .md file by replacing one exact literal string. USE THIS, NOT " +
+        "update_markdown, for any partial change — a fixed line, a corrected table row, a reworded " +
+        "paragraph, an added section under a heading. update_markdown requires the ENTIRE new " +
+        "document, so using it for a small change means regenerating text you never meant to touch " +
+        "and risks silently rewriting the rest of the report. Read the file with get_markdown first " +
+        "and copy `old_string` VERBATIM out of it, including indentation, punctuation and any blank " +
+        "lines. `old_string` must match EXACTLY ONCE: if it matches zero times, or more than once " +
+        "while replace_all is false, the edit is REJECTED and NOTHING is written — extend `old_string` " +
+        "with neighbouring lines until it is unique, or pass replace_all:true to change every " +
+        "occurrence on purpose. The write is always optimistic: the version just read is the base, so " +
+        "a concurrent write is retried once and then surfaces CONFLICT — there is no force mode. The " +
+        "file must already exist; this tool never creates one (use save_markdown for a new file). " +
+        "Because every edit is based on the version it just read, a file deleted out from under you " +
+        "is rejected rather than silently re-created.",
+      inputSchema: {
+        path: filePathField,
+        old_string: z
+          .string()
+          .min(1)
+          .describe(
+            "The EXACT literal text to find in the current document — not a regex, not a pattern, no " +
+              "wildcards. Copy it verbatim from get_markdown output; whitespace and line breaks must " +
+              "match. Must occur exactly once unless replace_all is true.",
+          ),
+        new_string: z
+          .string()
+          .describe(
+            "The literal text to put in its place, inserted as-is (no escaping, no '$' substitution). " +
+              "Pass an empty string to DELETE the matched text.",
+          ),
+        replace_all: z
+          .boolean()
+          .optional()
+          .describe(
+            "Opt in to replacing EVERY occurrence of `old_string` (e.g. renaming a term throughout the " +
+              "document). Default false = exactly one occurrence is required, otherwise the edit is " +
+              "rejected without writing.",
+          ),
+        commit_message: z
+          .string()
+          .max(500)
+          .optional()
+          .describe(
+            "A concise 1-2 line summary of WHAT you changed and WHY, written for a human reviewer " +
+              "scanning the version history (stored on the new version, shown next to it on web & " +
+              "mobile). ALWAYS provide this — describe the edit itself (e.g. 'Fixed the JWT TTL row: " +
+              "30d -> 14d after the security review').",
+          ),
+      },
+    },
+    async ({ path, old_string, new_string, replace_all, commit_message }): Promise<ToolResult> => {
+      try {
+        // #79: validate INSIDE the try so a path error returns the structured error contract.
+        const norm = validatePath(path, { requireMd: true });
+        if (old_string === new_string) {
+          throw new MdlogError(
+            "VALIDATION",
+            "old_string and new_string are identical — nothing to change, so no version was written.",
+          );
+        }
+        const all = replace_all === true;
+        let attempt = 0;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          try {
+            // getByPath THROWS NOT_FOUND for a missing document and that MUST propagate untouched —
+            // an edit never falls through to a create. (Contrast save_markdown/move_markdown, which
+            // deliberately swallow NOT_FOUND here; doing that would upsert a one-line file over a
+            // path the caller believed already held a report.) It sits INSIDE the loop so a CONFLICT
+            // retry genuinely re-reads and re-bases, exactly like append_to_markdown.
+            const doc = await client.getByPath(norm.path);
+            const existing = await client.materializeContent(doc);
+
+            // Occurrence safety: count BEFORE writing. 0 matches, or >1 without replace_all, aborts
+            // with NO mutation. VALIDATION (not NOT_FOUND) so the model cannot read a failed match as
+            // "the file is missing" and fall back to save_markdown, which is a force-overwrite.
+            // VALIDATION (not CONFLICT) so the retry branch below cannot swallow an unresolvable
+            // condition. `detail.reason` is the machine-readable discriminator; fail() already
+            // serializes it into structuredContent.error.detail.
+            const occurrences = countLiteral(existing, old_string);
+            if (occurrences === 0) {
+              throw new MdlogError(
+                "VALIDATION",
+                `old_string was not found in "${norm.path}" — nothing was written. Re-read the file ` +
+                  `with get_markdown and copy the text to replace verbatim (indentation, punctuation ` +
+                  `and line breaks must match exactly).`,
+                { detail: { reason: "NO_MATCH", path: norm.path, occurrences: 0 } },
+              );
+            }
+            if (occurrences > 1 && !all) {
+              throw new MdlogError(
+                "VALIDATION",
+                `old_string occurs ${occurrences} times in "${norm.path}" — ambiguous, so nothing was ` +
+                  `written. Extend old_string with surrounding lines until it is unique, or pass ` +
+                  `replace_all:true to change all ${occurrences} occurrences.`,
+                { detail: { reason: "AMBIGUOUS_MATCH", path: norm.path, occurrences } },
+              );
+            }
+
+            const baseVersionNo: unknown = doc?.current_version_no;
+            // Never let a missing version degrade this into a force-overwrite: putByPath omits
+            // base_version_no when it is undefined, and the backend reads an omitted base_version_no
+            // as "force LWW" (McpUpsertReq#baseVersionNo, DocumentServiceImpl.saveContent). That silent
+            // degradation is exactly why edit_markdown exposes no expected_version at all.
+            if (typeof baseVersionNo !== "number") {
+              throw new MdlogError(
+                "BACKEND_UNAVAILABLE",
+                `The backend did not report a current version for "${norm.path}", so this edit cannot be ` +
+                  `applied safely (it would degrade to a force-overwrite). Nothing was written.`,
+                { detail: doc ?? null },
+              );
+            }
+
+            // Literal splice only — String.replace/replaceAll would interpret '$&', '$1', "$'" in
+            // new_string as replacement patterns and silently corrupt the document.
+            const merged = all
+              ? replaceAllLiteral(existing, old_string, new_string)
+              : replaceFirstLiteral(existing, old_string, new_string);
+
+            const data = await client.putByPath({
+              path: norm.path,
+              content: merged,
+              baseVersionNo,
+              commitMessage: commit_message,
+              // The document — and therefore its folder — already exists; an edit must never
+              // re-create a folder tree that vanished between the read and the write.
+              createFolders: false,
+            });
+
+            const replaced = all ? occurrences : 1;
+            return ok(
+              `Edited "${norm.path}": replaced ${replaced} occurrence(s) of old_string (now version ` +
+                `${data?.current_version_no ?? "?"}).`,
+              {
+                path: norm.path,
+                document_key: data?.document_key ?? null,
+                current_version_no: data?.current_version_no ?? null,
+                base_version_no: baseVersionNo,
+                checksum_sha256: data?.checksum_sha256 ?? null,
+                occurrences,
+                replaced,
+                replace_all: all,
+              },
+            );
+          } catch (err) {
+            // Only CONFLICT is retried, and only once: re-read, re-count, re-base. A NO_MATCH /
+            // AMBIGUOUS_MATCH is deliberately NOT retryable — re-reading cannot resolve it, and if the
+            // re-read after a real conflict no longer contains old_string the caller is told so
+            // instead of having a stale edit applied blind.
+            if (err instanceof MdlogError && err.code === "CONFLICT" && attempt < 1) {
+              attempt++;
+              continue;
+            }
+            return fail(err);
+          }
+        }
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
   // --- update_markdown ---------------------------------------------------
   server.registerTool(
     "update_markdown",
     {
       title: "Update Markdown",
       description:
-        "Replace the content of an existing .md file. Pass expected_version for optimistic " +
-        "concurrency (mismatch -> CONFLICT); omit it to force last-writer-wins.",
+        "Replace the ENTIRE content of an existing .md file. For a PARTIAL change — a line, a row, a " +
+        "paragraph — use edit_markdown instead: it replaces one exact string in place, so you never " +
+        "regenerate (and never accidentally rewrite) the rest of the document. Reach for this tool " +
+        "only when you are genuinely rewriting the whole file. Pass expected_version for optimistic " +
+        "concurrency (mismatch -> CONFLICT); omit it to force last-writer-wins. If you pass " +
+        "expected_version for a path that does not exist you get CONFLICT (detail.server_version_no " +
+        "is 0), not a new file — use save_markdown to create.",
       inputSchema: {
         path: filePathField,
         content: z.string().describe("New full markdown content."),
@@ -863,6 +1036,87 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
             document_key: documentKey,
             current_version_no: doc?.current_version_no ?? null,
             versions,
+          },
+        );
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  // --- restore_version -----------------------------------------------------
+  server.registerTool(
+    "restore_version",
+    {
+      title: "Restore Version",
+      description:
+        "Roll a .md file back to an earlier version: version N's exact stored content becomes a NEW " +
+        "current version. History is immutable — nothing is deleted or rewound, the rollback is just " +
+        "another version on top, so it is itself undoable by restoring again. Use this after a bad " +
+        "write instead of retyping the old text through save_markdown, which would guess at the " +
+        "content and lose fidelity. Get version numbers from list_versions (and read one first with " +
+        "get_markdown + `version` if you want to check before rolling back). Restoring the version the " +
+        "file is already on is accepted and does nothing.",
+      inputSchema: {
+        path: filePathField,
+        version: z
+          .number()
+          .int()
+          .min(1)
+          .describe(
+            "The version_no to restore, from list_versions. Its content becomes the new current version.",
+          ),
+        commit_message: z
+          .string()
+          .max(500)
+          .optional()
+          .describe(
+            "A concise 1-2 line summary of WHY you are rolling back, written for a human reviewer " +
+              "scanning the version history (stored on the new version, shown next to it on web & " +
+              "mobile). ALWAYS provide this (e.g. 'Reverted to v7: the v8 rewrite dropped the incident " +
+              "timeline').",
+          ),
+      },
+    },
+    async ({ path, version, commit_message }): Promise<ToolResult> => {
+      try {
+        const norm = validatePath(path, { requireMd: true });
+        const doc = await client.getByPath(norm.path);
+        const documentKey: string | undefined = doc?.document_key ?? doc?.key;
+        if (!documentKey) {
+          throw new MdlogError("NOT_FOUND", `Could not resolve a document key for "${norm.path}".`);
+        }
+        const currentVersionNo: number | null = doc?.current_version_no ?? null;
+        // Fast, local pre-check for a genuinely impossible input. There is deliberately NO
+        // "version === current" rejection: the backend treats restore-to-head as an idempotent no-op,
+        // and a client that rejects what the server accepts is a divergence waiting to bite.
+        if (typeof currentVersionNo === "number" && version > currentVersionNo) {
+          throw new MdlogError(
+            "VALIDATION",
+            `"${norm.path}" has no version ${version} — the current version is v${currentVersionNo}. ` +
+              `Call list_versions to see the available version numbers.`,
+          );
+        }
+        const data = await client.restoreVersion(documentKey, version, commit_message);
+        const newVersionNo: number | null = data?.current_version_no ?? null;
+        // The backend makes restore-to-identical-content an idempotent no-op (it returns the UNCHANGED
+        // head), so an unmoved version number is a success, not a failure. Say so plainly instead of
+        // reporting a rollback that did not need to happen.
+        const noop = newVersionNo !== null && newVersionNo === currentVersionNo;
+        return ok(
+          noop
+            ? `"${norm.path}" is already byte-identical to v${version}; no new version was created ` +
+              `(still v${newVersionNo}).`
+            : `Restored "${norm.path}" from v${version}; its content is now version ` +
+              `${newVersionNo ?? "?"} (full history preserved).`,
+          {
+            path: norm.path,
+            document_key: documentKey,
+            restored_from_version: version,
+            previous_version_no: currentVersionNo,
+            current_version_no: newVersionNo,
+            checksum_sha256: data?.checksum_sha256 ?? null,
+            no_op: noop,
           },
         );
       } catch (err) {

@@ -25,7 +25,7 @@ Personal Access Token from the web app.
 
 ## Stack
 
-- **@modelcontextprotocol/sdk** (TypeScript) — one `McpServer` (15 tools), two transports.
+- **@modelcontextprotocol/sdk** (TypeScript) — one `McpServer` (17 tools), two transports.
 - **stdio transport** (`md-log-mcp`) — JSON-RPC over stdin/stdout; the default local mode (so stdout
   is reserved for the protocol; logs go to stderr). PAT from env.
 - **Streamable HTTP transport** (`md-log-mcp-http`) — the remote mode: agents connect by URL with no
@@ -44,7 +44,7 @@ Personal Access Token from the web app.
 That's it — the md-log service itself is hosted at `https://app.md-log.com`; there is nothing to
 install or self-host.
 
-## Tools (15)
+## Tools (17)
 
 Every tool returns dual output — a human-readable `content[].text` and a machine-readable
 `structuredContent` — and validates the POSIX path (NFC-normalize; reject `..`/`.`, control chars,
@@ -57,7 +57,9 @@ limits; require `.md` for files) **before** any backend call. All requests hit t
 | **`save_markdown`** ⭐ | The headline tool. Create or overwrite a `.md` by path (force last-writer-wins); missing folders auto-created. Optionally uploads embedded images first (each given as `data_base64` **or** a local `file_path`) and rewrites each `placeholder` in the content to an `asset://<key>` link. Accepts `commit_message` — a recommended 1-2 line change summary shown in the version history. |
 | `upload_asset` | Upload one image (reserve → presigned PUT → complete) and return an `asset://<key>` reference to embed as `![alt](asset://<key>)`. Provide the image as **either** `data_base64` (inline base64) **or** `file_path` (a local file the server reads) — exactly one; with `file_path`, `filename` defaults to the basename and `content_type` is inferred from the extension (png/jpg/jpeg/gif/webp/avif). |
 | `append_to_markdown` | Append to an existing file with optimistic concurrency (GET current → concat → conditional PUT with `base_version_no`). Auto-retries once on conflict, then surfaces `CONFLICT`. Accepts `commit_message` — a recommended 1-2 line change summary shown in the version history. |
-| `update_markdown` | Replace a file's content. Pass `expected_version` for optimistic concurrency (mismatch → `CONFLICT`); omit it to force LWW. Accepts `commit_message` — a recommended 1-2 line change summary shown in the version history. |
+| **`edit_markdown`** | Change PART of a file: replace one exact literal `old_string` with `new_string` (read → count → conditional PUT with `base_version_no`; auto-retries once on conflict). `old_string` must match **exactly once** — 0 matches or an ambiguous >1 is rejected with `VALIDATION` (`detail.reason` = `NO_MATCH` / `AMBIGUOUS_MATCH`) and **nothing is written**; pass `replace_all:true` to change every occurrence on purpose. Never creates a file (missing path → `NOT_FOUND`) and has no force mode — prefer it over `update_markdown` for any partial change. |
+| `update_markdown` | Replace a file's ENTIRE content. Pass `expected_version` for optimistic concurrency (mismatch → `CONFLICT`); omit it to force LWW. Passing `expected_version` for a path that does **not** exist now returns `CONFLICT` (`detail.server_version_no` = `0`), not a silent create. For a partial change use `edit_markdown` instead. Accepts `commit_message` — a recommended 1-2 line change summary shown in the version history. |
+| `restore_version` | Roll a file back to an earlier `version_no` (from `list_versions`): that version's content becomes a NEW current version — history is immutable, so the rollback is itself undoable. Restoring the version the file is already on is an accepted no-op. Accepts `commit_message`. |
 | `get_markdown` | Read a file's content by path (materializes inline content or a presigned content URL for large docs). Pass `version` (a `version_no` from `list_versions`) to read an old immutable version. |
 | `list_versions` | List a file's immutable version history, newest first (`version_no`, `commit_message`, author, `registered_at`, size). |
 | `delete_markdown` | Soft-delete a file. Requires `confirm:true` (otherwise `VALIDATION`); resolves the path to a document key first. |
@@ -90,6 +92,7 @@ for auth and quota.
 | -------- | -------- | ------- | ----- |
 | `MDLOG_API_BASE_URL` | yes | `https://app.md-log.com/api/v1` | The hosted service base, **including** `/api/v1`. No version suffix is appended; a trailing slash is stripped. |
 | `MDLOG_PAT` | yes | `mdlog_pat_xxxxxxxxxxxxxxxxxxxxxxxx` | Bearer PAT. **Store it securely (OS keychain) — never commit it.** |
+| `MDLOG_MAX_DOCUMENT_BYTES` | no | `26214400` (25 MiB) | Client-side pre-flight for the backend's per-document body cap, in **UTF-8 bytes** (Korean is 3 bytes/char). An over-cap save fails immediately with a `VALIDATION` error naming the actual size, instead of an opaque backend `400`. Applies to **both** transports. Change only against a self-hosted backend with a different cap. |
 
 The server fails fast at startup with a clear message if either var is missing or the base URL is
 malformed.
@@ -184,7 +187,7 @@ self-host md-log without a hosted MCP endpoint.
 
 ## Remote (Streamable HTTP) mode
 
-The second bin, **`md-log-mcp-http`**, serves the **same 15 tools** over MCP's
+The second bin, **`md-log-mcp-http`**, serves the **same 17 tools** over MCP's
 [Streamable HTTP transport](https://modelcontextprotocol.io/docs/concepts/transports) — a single
 `POST /mcp` endpoint — so agents connect by **URL with no local install**. Use it when you want to
 host the connector centrally (a container / small VM behind a TLS reverse proxy) instead of every
