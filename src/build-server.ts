@@ -27,7 +27,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { MdlogClient, MdlogError, sha256Hex } from "./client.js";
-import { countLiteral, replaceAllLiteral, replaceFirstLiteral, validatePath } from "./path.js";
+import { afterConcurrentWrite, applyLiteralEdits, MAX_EDITS, resolveEdits } from "./edit.js";
+import { replaceAllLiteral, validatePath } from "./path.js";
 
 /** Options that vary the tool surface per transport. */
 export interface BuildServerOptions {
@@ -250,7 +251,11 @@ async function resolveAssetBytes(
     // I-7: accept canonical base64 with OR without '=' padding — some encoders emit unpadded output that
     // Buffer.from decodes faithfully; the old `length % 4 !== 0` clause wrongly rejected it. Reject only
     // non-base64 characters and the impossible length (mod 4 === 1), then re-pad so decoding is exact.
-    const stripped = raw.replace(/=+$/, "");
+    // Strip the padding by scanning back from the end — NOT /=+$/, which backtracks quadratically over a
+    // long run of '=' that is not at the end ("="x40000 + "x" took 0.6 s; a multi-MB payload, hours).
+    let end = raw.length;
+    while (end > 0 && raw.charCodeAt(end - 1) === 0x3d /* '=' */) end--;
+    const stripped = raw.slice(0, end);
     if (!/^[A-Za-z0-9+/]*$/.test(stripped) || stripped.length % 4 === 1) {
       throw new MdlogError(
         "VALIDATION",
@@ -732,43 +737,73 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
     {
       title: "Edit Markdown",
       description:
-        "Change PART of an existing .md file by replacing one exact literal string. USE THIS, NOT " +
+        "Change PART of an existing .md file by replacing exact literal strings. USE THIS, NOT " +
         "update_markdown, for any partial change — a fixed line, a corrected table row, a reworded " +
         "paragraph, an added section under a heading. update_markdown requires the ENTIRE new " +
         "document, so using it for a small change means regenerating text you never meant to touch " +
         "and risks silently rewriting the rest of the report. Read the file with get_markdown first " +
-        "and copy `old_string` VERBATIM out of it, including indentation, punctuation and any blank " +
-        "lines. `old_string` must match EXACTLY ONCE: if it matches zero times, or more than once " +
-        "while replace_all is false, the edit is REJECTED and NOTHING is written — extend `old_string` " +
-        "with neighbouring lines until it is unique, or pass replace_all:true to change every " +
-        "occurrence on purpose. The write is always optimistic: the version just read is the base, so " +
-        "a concurrent write is retried once and then surfaces CONFLICT — there is no force mode. The " +
-        "file must already exist; this tool never creates one (use save_markdown for a new file). " +
-        "Because every edit is based on the version it just read, a file deleted out from under you " +
-        "is rejected rather than silently re-created.",
+        "and copy each `old_string` VERBATIM out of it, including indentation, punctuation and any " +
+        "blank lines. SEVERAL CHANGES TO ONE FILE? Send them together in ONE call via `edits` " +
+        "(an ordered list of {old_string, new_string, replace_all?}) with one commit_message: every " +
+        "call writes a new version AND notifies the user's devices, so one call per change floods " +
+        "their history and their phone. For a single change you may pass old_string/new_string " +
+        "directly instead of `edits` (never both). Edits apply in order, each against the text the " +
+        "previous ones produced. Each `old_string` must match EXACTLY ONCE — overlapping positions count, " +
+        "so \"\\n\\n\" inside a run of three newlines is ambiguous: zero matches, or more " +
+        "than once while replace_all is false, REJECTS THE WHOLE CALL and NOTHING is written " +
+        "(detail.edit_index names the failing edit) — extend that `old_string` with neighbouring " +
+        "lines until it is unique, or set replace_all:true to change every occurrence on purpose. " +
+        "The write is always optimistic: the version just read is the base, so a concurrent write is " +
+        "retried once (re-read, all edits re-applied) and then surfaces CONFLICT — there is no force " +
+        "mode. The file must already exist; this tool never creates one (use save_markdown for a new " +
+        "file). Because every edit is based on the version it just read, a file deleted out from " +
+        "under you is rejected rather than silently re-created.",
       inputSchema: {
         path: filePathField,
+        // The count/emptiness limits live in resolveEdits, NOT in this schema: a zod rejection surfaces
+        // as a bare -32602 protocol error with no structuredContent, so the agent would never receive
+        // the documented VALIDATION detail.reason (EMPTY_EDITS, TOO_MANY_EDITS, EMPTY_OLD_STRING).
+        edits: z
+          .array(
+            z.object({
+              old_string: z.string().describe("EXACT literal text to find (see old_string). Non-empty."),
+              new_string: z.string().describe("Literal replacement; empty string deletes the match."),
+              replace_all: z
+                .boolean()
+                .optional()
+                .describe("Replace every occurrence of this old_string instead of exactly one."),
+            }),
+          )
+          .optional()
+          .describe(
+            `Ordered list of literal edits applied in ONE write (one version, one notification), ` +
+              `all-or-nothing. Prefer this whenever you change a file in more than one place. ` +
+              `At most ${MAX_EDITS} edits. Do not combine with top-level old_string/new_string.`,
+          ),
         old_string: z
           .string()
-          .min(1)
+          .optional()
           .describe(
-            "The EXACT literal text to find in the current document — not a regex, not a pattern, no " +
-              "wildcards. Copy it verbatim from get_markdown output; whitespace and line breaks must " +
-              "match. Must occur exactly once unless replace_all is true.",
+            "Single-edit shorthand. The EXACT, non-empty literal text to find in the current document — not a " +
+              "regex, not a pattern, no wildcards. Copy it verbatim from get_markdown output; " +
+              "whitespace and line breaks must match. Must occur exactly once unless replace_all is " +
+              "true. Omit when using `edits`.",
           ),
         new_string: z
           .string()
+          .optional()
           .describe(
-            "The literal text to put in its place, inserted as-is (no escaping, no '$' substitution). " +
-              "Pass an empty string to DELETE the matched text.",
+            "Single-edit shorthand. The literal text to put in its place, inserted as-is (no " +
+              "escaping, no '$' substitution). Pass an empty string to DELETE the matched text. " +
+              "Omit when using `edits`.",
           ),
         replace_all: z
           .boolean()
           .optional()
           .describe(
-            "Opt in to replacing EVERY occurrence of `old_string` (e.g. renaming a term throughout the " +
-              "document). Default false = exactly one occurrence is required, otherwise the edit is " +
-              "rejected without writing.",
+            "Single-edit shorthand. Opt in to replacing EVERY occurrence of `old_string` (e.g. " +
+              "renaming a term throughout the document). Default false = exactly one occurrence is " +
+              "required, otherwise the edit is rejected without writing.",
           ),
         commit_message: z
           .string()
@@ -777,22 +812,17 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
           .describe(
             "A concise 1-2 line summary of WHAT you changed and WHY, written for a human reviewer " +
               "scanning the version history (stored on the new version, shown next to it on web & " +
-              "mobile). ALWAYS provide this — describe the edit itself (e.g. 'Fixed the JWT TTL row: " +
-              "30d -> 14d after the security review').",
+              "mobile). ALWAYS provide this — with several edits, summarize them together (e.g. " +
+              "'Fixed the JWT TTL row (30d -> 14d) and updated the rollout conclusion').",
           ),
       },
     },
-    async ({ path, old_string, new_string, replace_all, commit_message }): Promise<ToolResult> => {
+    async ({ path, edits, old_string, new_string, replace_all, commit_message }): Promise<ToolResult> => {
       try {
         // #79: validate INSIDE the try so a path error returns the structured error contract.
         const norm = validatePath(path, { requireMd: true });
-        if (old_string === new_string) {
-          throw new MdlogError(
-            "VALIDATION",
-            "old_string and new_string are identical — nothing to change, so no version was written.",
-          );
-        }
-        const all = replace_all === true;
+        // Resolved once, before any read: an invalid input shape must never cost a backend round-trip.
+        const plan = resolveEdits({ edits, old_string, new_string, replace_all }, norm.path);
         let attempt = 0;
         // eslint-disable-next-line no-constant-condition
         while (true) {
@@ -805,31 +835,12 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
             const doc = await client.getByPath(norm.path);
             const existing = await client.materializeContent(doc);
 
-            // Occurrence safety: count BEFORE writing. 0 matches, or >1 without replace_all, aborts
-            // with NO mutation. VALIDATION (not NOT_FOUND) so the model cannot read a failed match as
-            // "the file is missing" and fall back to save_markdown, which is a force-overwrite.
-            // VALIDATION (not CONFLICT) so the retry branch below cannot swallow an unresolvable
-            // condition. `detail.reason` is the machine-readable discriminator; fail() already
-            // serializes it into structuredContent.error.detail.
-            const occurrences = countLiteral(existing, old_string);
-            if (occurrences === 0) {
-              throw new MdlogError(
-                "VALIDATION",
-                `old_string was not found in "${norm.path}" — nothing was written. Re-read the file ` +
-                  `with get_markdown and copy the text to replace verbatim (indentation, punctuation ` +
-                  `and line breaks must match exactly).`,
-                { detail: { reason: "NO_MATCH", path: norm.path, occurrences: 0 } },
-              );
-            }
-            if (occurrences > 1 && !all) {
-              throw new MdlogError(
-                "VALIDATION",
-                `old_string occurs ${occurrences} times in "${norm.path}" — ambiguous, so nothing was ` +
-                  `written. Extend old_string with surrounding lines until it is unique, or pass ` +
-                  `replace_all:true to change all ${occurrences} occurrences.`,
-                { detail: { reason: "AMBIGUOUS_MATCH", path: norm.path, occurrences } },
-              );
-            }
+            // Occurrence safety: every edit is counted and applied IN MEMORY before anything is
+            // written; any 0-match or ambiguous >1 aborts the whole call with NO mutation (all-or-
+            // nothing). applyLiteralEdits throws VALIDATION — never NOT_FOUND (the model would fall back
+            // to the force-writing save_markdown) and never CONFLICT (the retry below would swallow
+            // it). `detail.reason` / `detail.edit_index` reach structuredContent.error.detail via fail().
+            const applied = applyLiteralEdits(existing, plan, norm.path);
 
             const baseVersionNo: unknown = doc?.current_version_no;
             // Never let a missing version degrade this into a force-overwrite: putByPath omits
@@ -845,15 +856,10 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
               );
             }
 
-            // Literal splice only — String.replace/replaceAll would interpret '$&', '$1', "$'" in
-            // new_string as replacement patterns and silently corrupt the document.
-            const merged = all
-              ? replaceAllLiteral(existing, old_string, new_string)
-              : replaceFirstLiteral(existing, old_string, new_string);
-
+            // ONE write for the whole batch: one version, one push, one inbox row per recipient.
             const data = await client.putByPath({
               path: norm.path,
-              content: merged,
+              content: applied.content,
               baseVersionNo,
               commitMessage: commit_message,
               // The document — and therefore its folder — already exists; an edit must never
@@ -861,31 +867,36 @@ export function buildServer(client: MdlogClient, opts: BuildServerOptions = {}):
               createFolders: false,
             });
 
-            const replaced = all ? occurrences : 1;
+            const replaced = applied.results.reduce((sum, r) => sum + r.replaced, 0);
+            const first = applied.results[0];
             return ok(
-              `Edited "${norm.path}": replaced ${replaced} occurrence(s) of old_string (now version ` +
-                `${data?.current_version_no ?? "?"}).`,
+              `Edited "${norm.path}": applied ${applied.results.length} edit(s), replacing ${replaced} ` +
+                `occurrence(s), in one write (now version ${data?.current_version_no ?? "?"}).`,
               {
                 path: norm.path,
                 document_key: data?.document_key ?? null,
                 current_version_no: data?.current_version_no ?? null,
                 base_version_no: baseVersionNo,
                 checksum_sha256: data?.checksum_sha256 ?? null,
-                occurrences,
+                edit_count: applied.results.length,
                 replaced,
-                replace_all: all,
+                edits: applied.results,
+                // Single-edit fields kept for callers written before batch mode (<= 1.2.0).
+                occurrences: first?.occurrences ?? 0,
+                replace_all: first?.replace_all ?? false,
               },
             );
           } catch (err) {
-            // Only CONFLICT is retried, and only once: re-read, re-count, re-base. A NO_MATCH /
-            // AMBIGUOUS_MATCH is deliberately NOT retryable — re-reading cannot resolve it, and if the
-            // re-read after a real conflict no longer contains old_string the caller is told so
-            // instead of having a stale edit applied blind.
+            // Only CONFLICT is retried, and only once: re-read, re-apply every edit, re-base. A
+            // NO_MATCH / AMBIGUOUS_MATCH is deliberately NOT retryable — re-reading cannot resolve it,
+            // and if the re-read after a real conflict no longer contains an old_string the caller is
+            // told so — including that a concurrent write is why — instead of having a stale edit
+            // applied blind.
             if (err instanceof MdlogError && err.code === "CONFLICT" && attempt < 1) {
               attempt++;
               continue;
             }
-            return fail(err);
+            return fail(attempt > 0 ? afterConcurrentWrite(err) : err);
           }
         }
       } catch (err) {

@@ -12,6 +12,7 @@
  */
 
 import { MdlogError } from "./client.js";
+import { literalFinder, type LiteralFinder, NATIVE_SEARCH_MAX_NEEDLE } from "./literal.js";
 
 const RESERVED_NAMES = new Set([
   ".",
@@ -130,10 +131,28 @@ export function validatePath(
   };
 }
 
-/** Replace every literal occurrence of `needle` in `haystack` (no regex semantics). */
-export function replaceAllLiteral(haystack: string, needle: string, replacement: string): string {
+/**
+ * Replace every literal occurrence of `needle` in `haystack` (no regex semantics), left to right and
+ * non-overlapping. Short needles use native split()/join(); longer ones walk literalFinder, because split()
+ * shares indexOf's superlinear path for them (see literal.ts). Pass `find` to reuse a finder already built
+ * for this needle.
+ */
+export function replaceAllLiteral(
+  haystack: string,
+  needle: string,
+  replacement: string,
+  find: LiteralFinder = literalFinder(needle),
+): string {
   if (needle.length === 0) return haystack;
-  return haystack.split(needle).join(replacement);
+  if (needle.length <= NATIVE_SEARCH_MAX_NEEDLE) return haystack.split(needle).join(replacement);
+  const parts: string[] = [];
+  let from = 0;
+  for (let at = find(haystack, 0); at !== -1; at = find(haystack, from)) {
+    parts.push(haystack.slice(from, at), replacement);
+    from = at + needle.length;
+  }
+  parts.push(haystack.slice(from));
+  return parts.join("");
 }
 
 /**
@@ -144,12 +163,12 @@ export function replaceAllLiteral(haystack: string, needle: string, replacement:
  *
  * edit_markdown counts BEFORE writing: 0 matches or an ambiguous >1 must abort with no mutation.
  */
-export function countLiteral(haystack: string, needle: string): number {
+export function countLiteral(haystack: string, needle: string, find: LiteralFinder = literalFinder(needle)): number {
   if (needle.length === 0) return 0;
   let count = 0;
   let from = 0;
   for (;;) {
-    const at = haystack.indexOf(needle, from);
+    const at = find(haystack, from);
     if (at === -1) return count;
     count++;
     from = at + needle.length;
@@ -157,15 +176,20 @@ export function countLiteral(haystack: string, needle: string): number {
 }
 
 /**
- * Replace the FIRST literal occurrence of `needle`; returns `haystack` unchanged when absent.
+ * Replace the FIRST literal occurrence of `needle`; returns `haystack` unchanged when absent. Pass `at`
+ * when that occurrence was already found (by a finder for this same needle) so the text is not searched
+ * a second time.
  *
  * Uses slice(), NOT String.prototype.replace(): replace() treats '$&', '$1', "$'" and '$`' inside the
  * REPLACEMENT string as substitution patterns, which would silently corrupt a document whose new text
  * contains a '$'. Both replacement helpers here are literal in both directions.
  */
-export function replaceFirstLiteral(haystack: string, needle: string, replacement: string): string {
-  if (needle.length === 0) return haystack;
-  const at = haystack.indexOf(needle);
-  if (at === -1) return haystack;
+export function replaceFirstLiteral(
+  haystack: string,
+  needle: string,
+  replacement: string,
+  at: number = literalFinder(needle)(haystack, 0),
+): string {
+  if (needle.length === 0 || at === -1) return haystack;
   return haystack.slice(0, at) + replacement + haystack.slice(at + needle.length);
 }
