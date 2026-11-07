@@ -7,7 +7,7 @@
  * backend (tools/list is static; the file_path refusal fails BEFORE any HTTP call;
  * the 401/403 checks are rejected at the edge), so NO backend or real PAT is needed:
  *
- *   1. initialize + tools/list          — full handshake works, all 15 tools present
+ *   1. initialize + tools/list          — full handshake works, all 17 tools present
  *   2. upload_asset { file_path }        — refused (remote transport blocks local files)
  *   3. POST without Authorization        — 401 Unauthorized
  *   4. POST with a disallowed Origin     — 403 Forbidden
@@ -115,7 +115,7 @@ async function main() {
     await client.connect(transport);
     const list = await client.listTools();
     const names = (list.tools ?? []).map((t) => t.name).sort();
-    step("initialize + tools/list", names.length === 15, `${names.length} tools: ${names.join(", ")}`);
+    step("initialize + tools/list", names.length === 17, `${names.length} tools: ${names.join(", ")}`);
 
     // 2) file_path over the remote transport must be refused (no backend call).
     const refused = await client.callTool({
